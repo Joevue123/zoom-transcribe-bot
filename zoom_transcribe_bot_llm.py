@@ -1,42 +1,25 @@
 import io
 import wave
-import sounddevice as sd
+import pyaudiowpatch as pyaudio
 import numpy as np
 import queue
 import time
 import os
 from datetime import datetime
+from faster_whisper import WhisperModel
 from openai import OpenAI
 
 # ========================= CONFIG =========================
 SAMPLE_RATE = 16000
-CHANNELS = 1
 CHUNK_DURATION_SEC = 8          # Transcription chunk size
 
-# Choose your LLM provider: "gpt-4o" or "grok"
-LLM_PROVIDER = "gpt-4o"         # Change to "grok" if preferred
+# Ollama (local) for LLM analysis
+client = OpenAI(api_key="ollama", base_url="http://localhost:11434/v1")
+LLM_MODEL = "llama3.2:1b"
 
-# Set to a specific device index for virtual audio (e.g. VB-Cable, Blackhole).
-# Run: python -c "import sounddevice as sd; print(sd.query_devices())" to list devices.
-DEVICE_INDEX = 13                # Stereo Mix - captures all Windows/Zoom system audio
-
-# API Keys (use environment variables for security)
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-XAI_API_KEY = os.getenv("XAI_API_KEY")
-
-# Dedicated OpenAI client for Whisper transcription (always required)
-transcription_client = OpenAI(api_key=OPENAI_API_KEY)
-
-# LLM client (may differ from transcription client)
-if LLM_PROVIDER == "grok":
-    client = OpenAI(
-        api_key=XAI_API_KEY,
-        base_url="https://api.x.ai/v1"
-    )
-    LLM_MODEL = "grok-4"  # or "grok-3" depending on availability
-else:
-    client = OpenAI(api_key=OPENAI_API_KEY)
-    LLM_MODEL = "gpt-4o"
+# faster-whisper runs locally — no API key needed
+# Model options: "tiny", "base", "small", "medium", "large-v3"
+WHISPER_MODEL_SIZE = "tiny"
 
 # Trading keywords (simple fallback)
 TRADING_KEYWORDS = {
@@ -46,8 +29,6 @@ TRADING_KEYWORDS = {
 }
 
 audio_queue = queue.Queue()
-
-# Log file for this session
 LOG_FILE = f"trading_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
 # ========================================================
 
@@ -57,16 +38,10 @@ def log(message: str):
         f.write(message + "\n")
 
 
-def audio_callback(indata, frames, time_info, status):
-    if status:
-        print(status)
-    audio_queue.put(indata.copy())
-
-
 def numpy_to_wav_bytes(audio_data: np.ndarray) -> bytes:
     byte_io = io.BytesIO()
     with wave.open(byte_io, 'wb') as wf:
-        wf.setnchannels(CHANNELS)
+        wf.setnchannels(1)
         wf.setsampwidth(2)
         wf.setframerate(SAMPLE_RATE)
         wf.writeframes(audio_data.flatten().tobytes())
@@ -74,16 +49,12 @@ def numpy_to_wav_bytes(audio_data: np.ndarray) -> bytes:
     return byte_io.read()
 
 
-def transcribe_chunk(audio_data: np.ndarray):
+def transcribe_chunk(whisper_model: WhisperModel, audio_data: np.ndarray) -> str:
     wav_bytes = numpy_to_wav_bytes(audio_data)
     try:
-        transcript = transcription_client.audio.transcriptions.create(
-            model="whisper-1",
-            file=("audio.wav", wav_bytes, "audio/wav"),
-            language="en",
-            response_format="text"
-        )
-        return transcript.strip()
+        audio_file = io.BytesIO(wav_bytes)
+        segments, _ = whisper_model.transcribe(audio_file, language="en")
+        return " ".join(s.text.strip() for s in segments).strip()
     except Exception as e:
         print(f"Transcription Error: {e}")
         return ""
@@ -109,7 +80,7 @@ Keep response concise (max 150 words) and structured."""
                 {"role": "user", "content": f"Transcript excerpt: {transcript}"}
             ],
             temperature=0.3,
-            max_completion_tokens=300
+            max_tokens=300
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
@@ -128,7 +99,6 @@ def trading_logic(transcript: str):
     print(entry)
     log(entry)
 
-    # Quick keyword scan
     signals = []
     for action, keywords in TRADING_KEYWORDS.items():
         if any(kw in lower for kw in keywords):
@@ -139,65 +109,89 @@ def trading_logic(transcript: str):
         print(f"[!] {sig_line}")
         log(sig_line)
 
-    # LLM Deep Analysis
-    print("[~] Running LLM trade analysis...")
-    analysis = analyze_with_llm(transcript)
-
-    if analysis:
-        analysis_entry = f"LLM ANALYSIS:\n{analysis}\n"
-        print(f"[+] {analysis_entry}")
-        log(analysis_entry)
+    # LLM analysis disabled — re-enable when upgrading hardware
 
 
 def main():
-    print(f"[*] Zoom Trading Bot with {LLM_PROVIDER.upper()} Reasoning Layer Started")
-    print(f"Model: {LLM_MODEL} | Chunk: {CHUNK_DURATION_SEC}s | Log: {LOG_FILE}\n")
+    print(f"[*] Zoom Trading Bot | Whisper ({WHISPER_MODEL_SIZE}, local) + Keyword Signals")
+    print(f"Chunk: {CHUNK_DURATION_SEC}s | Log: {LOG_FILE}\n")
 
-    if not OPENAI_API_KEY:
-        print("❌ OPENAI_API_KEY is required (used for Whisper transcription).")
+    print("[*] Loading Whisper model (first run downloads it)...")
+    whisper_model = WhisperModel(WHISPER_MODEL_SIZE, device="cpu", compute_type="int8")
+    print("[*] Whisper model ready.\n")
+
+    p = pyaudio.PyAudio()
+
+    loopback_device = None
+    for i in range(p.get_device_count()):
+        dev = p.get_device_info_by_index(i)
+        if dev.get("isLoopbackDevice") and dev["maxInputChannels"] > 0:
+            loopback_device = dev
+            loopback_idx = i
+            break
+
+    if loopback_device is None:
+        print("No WASAPI loopback device found.")
+        p.terminate()
         return
-    if LLM_PROVIDER == "grok" and not XAI_API_KEY:
-        print("❌ XAI_API_KEY is required when LLM_PROVIDER is 'grok'.")
-        return
 
-    if DEVICE_INDEX is not None:
-        print(f"Audio device: {sd.query_devices(DEVICE_INDEX)['name']}")
-    else:
-        print("Audio device: system default (set DEVICE_INDEX to capture Zoom audio)")
+    print(f"Audio device: {loopback_device['name']} (WASAPI loopback)")
 
-    stream = sd.InputStream(
-        samplerate=SAMPLE_RATE,
-        channels=CHANNELS,
-        dtype='int16',
-        callback=audio_callback,
-        blocksize=int(SAMPLE_RATE * CHUNK_DURATION_SEC),
-        device=DEVICE_INDEX
+    dev_channels = int(loopback_device["maxInputChannels"])
+    src_rate = int(loopback_device["defaultSampleRate"])
+    buffer = np.array([], dtype=np.int16)
+
+    def pyaudio_callback(in_data, frame_count, time_info, status):
+        audio_queue.put(in_data)
+        return (None, pyaudio.paContinue)
+
+    stream = p.open(
+        format=pyaudio.paInt16,
+        channels=dev_channels,
+        rate=src_rate,
+        frames_per_buffer=1024,
+        input=True,
+        input_device_index=loopback_idx,
+        stream_callback=pyaudio_callback
     )
 
-    with stream:
-        buffer = np.array([], dtype=np.int16)
+    print("[*] Listening... (Ctrl+C to stop)\n")
+    stream.start_stream()
 
-        while True:
+    try:
+        while stream.is_active():
             try:
-                chunk = audio_queue.get(timeout=1)
+                raw = audio_queue.get(timeout=1)
+                chunk = np.frombuffer(raw, dtype=np.int16)
+
+                if dev_channels > 1:
+                    chunk = chunk.reshape(-1, dev_channels).mean(axis=1).astype(np.int16)
+
+                if src_rate != SAMPLE_RATE:
+                    new_len = int(len(chunk) * SAMPLE_RATE / src_rate)
+                    chunk = np.interp(
+                        np.linspace(0, len(chunk), new_len),
+                        np.arange(len(chunk)),
+                        chunk
+                    ).astype(np.int16)
+
                 buffer = np.append(buffer, chunk)
 
                 if len(buffer) >= SAMPLE_RATE * CHUNK_DURATION_SEC:
-                    text = transcribe_chunk(buffer)
-
+                    text = transcribe_chunk(whisper_model, buffer[:SAMPLE_RATE * CHUNK_DURATION_SEC])
                     if text:
                         trading_logic(text)
-
-                    buffer = np.array([], dtype=np.int16)
+                    buffer = buffer[SAMPLE_RATE * CHUNK_DURATION_SEC:]
 
             except queue.Empty:
                 continue
-            except KeyboardInterrupt:
-                print("\nStopping bot...")
-                break
-            except Exception as e:
-                print(f"Error: {e}")
-                time.sleep(1)
+
+    except KeyboardInterrupt:
+        print("\nStopping bot...")
+    finally:
+        stream.stop_stream()
+        stream.close()
+        p.terminate()
 
 
 if __name__ == "__main__":
