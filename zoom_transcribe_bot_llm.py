@@ -1,5 +1,7 @@
 import io
 import wave
+import json
+import threading
 import pyaudiowpatch as pyaudio
 import numpy as np
 import queue
@@ -30,7 +32,35 @@ TRADING_KEYWORDS = {
 
 audio_queue = queue.Queue()
 LOG_FILE = f"trading_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+SIGNALS_FILE = "signals.json"
+_signals_lock = threading.Lock()
 # ========================================================
+
+
+def init_signals_file():
+    data = {"last_updated": None, "counts": {"BUY": 0, "SELL": 0, "ALERT": 0}, "events": []}
+    with open(SIGNALS_FILE, "w") as f:
+        json.dump(data, f)
+
+
+def write_signal_event(transcript: str, signals: list):
+    with _signals_lock:
+        try:
+            with open(SIGNALS_FILE, "r") as f:
+                data = json.load(f)
+        except Exception:
+            data = {"last_updated": None, "counts": {"BUY": 0, "SELL": 0, "ALERT": 0}, "events": []}
+
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        event = {"id": len(data["events"]) + 1, "timestamp": timestamp, "transcript": transcript, "signals": signals}
+        data["events"].insert(0, event)
+        data["events"] = data["events"][:100]  # keep last 100
+        data["last_updated"] = timestamp
+        for s in signals:
+            data["counts"][s] = data["counts"].get(s, 0) + 1
+
+        with open(SIGNALS_FILE, "w") as f:
+            json.dump(data, f)
 
 
 def log(message: str):
@@ -109,10 +139,13 @@ def trading_logic(transcript: str):
         print(f"[!] {sig_line}")
         log(sig_line)
 
+    write_signal_event(transcript, signals)
+
     # LLM analysis disabled — re-enable when upgrading hardware
 
 
 def main():
+    init_signals_file()
     print(f"[*] Zoom Trading Bot | Whisper ({WHISPER_MODEL_SIZE}, local) + Keyword Signals")
     print(f"Chunk: {CHUNK_DURATION_SEC}s | Log: {LOG_FILE}\n")
 
